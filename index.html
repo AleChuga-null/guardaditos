@@ -180,6 +180,8 @@ h1{font:800 clamp(2.1rem,8vw,3.2rem)/1 var(--f-display);letter-spacing:-.03em;ma
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:6px 0;
 }
 a.reflink:hover{text-decoration:underline}
+.locked .wrap > :not(.top):not(#auth){display:none!important}
+.locked .fab{display:none}
 @media (max-width:520px){ .row2{grid-template-columns:1fr} }
 @media (prefers-reduced-motion:reduce){ *{transition:none!important} }
 </style>
@@ -191,7 +193,29 @@ a.reflink:hover{text-decoration:underline}
       <p class="sub">Tus reels y webs, en carpetas.</p>
     </div>
     <p class="count" id="count"></p>
+    <button type="button" class="btn ghost" id="logoutBtn" hidden>Cerrar sesión</button>
   </header>
+
+  <section class="panel" id="auth" hidden aria-labelledby="authTitle">
+    <h2 id="authTitle">Entra en Guardaditos</h2>
+    <p class="hint">Tus guardados son privados y se sincronizan en todos tus dispositivos.</p>
+    <form id="authForm" style="display:flex;flex-direction:column;gap:12px" novalidate>
+      <div class="field">
+        <label for="a-email">Correo</label>
+        <input id="a-email" type="email" autocomplete="email" inputmode="email" autocapitalize="off">
+      </div>
+      <div class="field">
+        <label for="a-pass">Contraseña</label>
+        <input id="a-pass" type="password" autocomplete="current-password" minlength="8">
+      </div>
+      <p class="error" id="a-error" role="alert"></p>
+      <p class="hint" id="a-info" role="status"></p>
+      <div class="row-btns">
+        <button type="submit" class="btn primary">Entrar</button>
+        <button type="button" class="btn" id="a-signup">Crear cuenta</button>
+      </div>
+    </form>
+  </section>
 
   <p class="status" id="status" role="status" hidden></p>
 
@@ -284,12 +308,15 @@ a.reflink:hover{text-decoration:underline}
 <button type="button" class="fab" id="fab" disabled>+ Guardar enlace</button>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function(){
 'use strict';
 var $ = function(id){ return document.getElementById(id); };
 var HUES = 5;
 var LS_KEY = 'guardaditos-v1';
+var SUPABASE_URL = 'PEGA_AQUI_LA_URL_DE_TU_PROYECTO';
+var SUPABASE_KEY = 'PEGA_AQUI_LA_CLAVE_PUBLICA';
 var DEFAULT_FOLDERS = [
   { id:'f_programar', name:'Webs para programar', hue:3 },
   { id:'f_belleza', name:'Belleza', hue:0 }
@@ -510,7 +537,7 @@ function renderStatus(){
   if(state.failed) msg = 'No se pueden cargar tus guardados ahora mismo. Vuelve a abrir la página en un rato.';
   else if(state.mode === 'loading' || (state.mode === 'db' && !state.got)) msg = state.slow ? 'Todavía no se alcanzan tus guardados. Si ves datos, pueden no estar al día.' : 'Cargando tus guardados…';
   else if(state.mode === 'db' && state.slow && !state.confirmed) msg = 'Si ves datos, pueden no estar al día: no se ha podido confirmar la conexión.';
-  else if(state.mode === 'local') msg = 'Tus guardados se quedan solo en este navegador y este dispositivo.';
+  else if(state.mode === 'local') msg = 'Sin cuenta conectada: tus guardados se quedan solo en este navegador.';
   s.hidden = !msg;
   s.textContent = msg;
 }
@@ -942,9 +969,137 @@ function startDb(db, uid){
     afterSnapshot('tasks', snap.metadata.fromCache);
   }, onDbError);
 }
+/* ---------- Supabase: cuenta y sincronización ---------- */
+var sbClient = null;
+function supaReady(){
+  return !!(window.supabase && /^https:\/\//.test(SUPABASE_URL) && SUPABASE_KEY.length > 20);
+}
+function makeSupaDb(sb, uid){
+  var mem = { app:null, link:{}, task:{} }, loaded = false;
+  var subs = { app:[], link:[], task:[] }, errs = [];
+  function appSnap(){ var d = mem.app; return { exists:!!d, data:function(){ return d; }, metadata:{ fromCache:false } }; }
+  function collSnap(k){
+    var o = mem[k];
+    return { docs:Object.keys(o).map(function(id){ return { id:id, data:function(){ return o[id]; } }; }), metadata:{ fromCache:false } };
+  }
+  function notify(k){
+    if(!loaded) return;
+    subs[k].forEach(function(f){ f(k === 'app' ? appSnap() : collSnap(k)); });
+  }
+  function slot(kind){ return kind === 'folders' ? 'app' : kind; }
+  function check(r){ if(r && r.error) throw r.error; }
+  function put(kind, id, data){
+    if(kind === 'folders') mem.app = data; else mem[kind][id] = data;
+    notify(slot(kind));
+    return sb.from('items').upsert({ user_id:uid, kind:kind, id:id, data:data, updated_at:new Date().toISOString() }).then(check);
+  }
+  function del(kind, id){
+    delete mem[kind][id];
+    notify(kind);
+    return sb.from('items').delete().eq('user_id', uid).eq('kind', kind).eq('id', id).then(check);
+  }
+  function load(){
+    return sb.from('items').select('kind,id,data').then(function(r){
+      if(r.error) throw r.error;
+      var next = { app:null, link:{}, task:{} };
+      (r.data || []).forEach(function(row){
+        if(row.kind === 'folders') next.app = row.data;
+        else if(next[row.kind]) next[row.kind][row.id] = row.data;
+      });
+      mem = next; loaded = true;
+      notify('app'); notify('link'); notify('task');
+    }).catch(function(e){
+      errs.forEach(function(f){ if(f) f({ code:'unavailable', message:String((e && e.message) || e) }); });
+    });
+  }
+  function collRef(k){
+    return {
+      doc:function(id){ return { set:function(d){ return put(k, id, d); }, delete:function(){ return del(k, id); } }; },
+      onSnapshot:function(next, err){ subs[k].push(next); errs.push(err); if(loaded) next(collSnap(k)); return function(){}; }
+    };
+  }
+  var appRef = {
+    set:function(d){ return put('folders', 'app', d); },
+    onSnapshot:function(next, err){ subs.app.push(next); errs.push(err); if(loaded) next(appSnap()); return function(){}; },
+    collection:function(name){ return collRef(name === 'links' ? 'link' : 'task'); }
+  };
+  try{
+    sb.channel('items-' + uid).on('postgres_changes', { event:'*', schema:'public', table:'items', filter:'user_id=eq.' + uid }, function(p){
+      var del_ = p.eventType === 'DELETE', row = del_ ? p.old : p.new;
+      if(!row || !row.kind) return;
+      if(del_){ if(row.kind !== 'folders' && mem[row.kind]) delete mem[row.kind][row.id]; }
+      else if(row.kind === 'folders') mem.app = row.data;
+      else if(mem[row.kind]) mem[row.kind][row.id] = row.data;
+      notify(slot(row.kind));
+    }).subscribe();
+  }catch(e){}
+  document.addEventListener('visibilitychange', function(){ if(!document.hidden && loaded) load(); });
+  load();
+  return { doc:function(){ return appRef; } };
+}
+function showAuth(){
+  document.body.classList.add('locked');
+  $('auth').hidden = false;
+  $('a-email').focus();
+}
+function enterApp(user){
+  $('auth').hidden = true;
+  document.body.classList.remove('locked');
+  $('logoutBtn').hidden = false;
+  $('logoutBtn').title = user.email || '';
+  startDb(makeSupaDb(sbClient, user.id), user.id);
+}
+function authMsg(e){
+  var m = String((e && e.message) || '');
+  if(/invalid login credentials/i.test(m)) return 'Correo o contraseña incorrectos.';
+  if(/email not confirmed/i.test(m)) return 'Falta confirmar el correo. Mira tu bandeja de entrada.';
+  if(/already registered/i.test(m)) return 'Ese correo ya tiene cuenta. Pulsa Entrar.';
+  if(/signups? not allowed|signup is disabled/i.test(m)) return 'El registro de cuentas nuevas está desactivado.';
+  if(/rate limit/i.test(m)) return 'Demasiados intentos. Espera unos minutos.';
+  return m || 'No se pudo completar. Inténtalo de nuevo.';
+}
+function setAuthBusy(b){
+  $('a-signup').disabled = b;
+  $('authForm').querySelector('button[type="submit"]').disabled = b;
+}
+function doAuth(mode){
+  var email = $('a-email').value.trim(), pass = $('a-pass').value;
+  $('a-error').textContent = ''; $('a-info').textContent = '';
+  if(!email || pass.length < 8){
+    $('a-error').textContent = 'Escribe tu correo y una contraseña de al menos 8 caracteres.';
+    return;
+  }
+  setAuthBusy(true);
+  var p = mode === 'in'
+    ? sbClient.auth.signInWithPassword({ email:email, password:pass })
+    : sbClient.auth.signUp({ email:email, password:pass });
+  p.then(function(r){
+    setAuthBusy(false);
+    if(r.error){ $('a-error').textContent = authMsg(r.error); return; }
+    if(r.data && r.data.session) enterApp(r.data.session.user);
+    else $('a-info').textContent = 'Te hemos enviado un correo para confirmar tu cuenta. Ábrelo y después vuelve aquí a entrar.';
+  }).catch(function(){
+    setAuthBusy(false);
+    $('a-error').textContent = 'No se pudo conectar. Revisa tu conexión e inténtalo de nuevo.';
+  });
+}
+function startSupabase(){
+  sbClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  $('authForm').addEventListener('submit', function(e){ e.preventDefault(); doAuth('in'); });
+  $('a-signup').addEventListener('click', function(){ doAuth('up'); });
+  $('logoutBtn').addEventListener('click', function(){ sbClient.auth.signOut(); });
+  sbClient.auth.onAuthStateChange(function(ev){ if(ev === 'SIGNED_OUT') location.reload(); });
+  sbClient.auth.getSession().then(function(r){
+    var s = r && r.data && r.data.session;
+    if(s) enterApp(s.user); else showAuth();
+  }).catch(function(){ showAuth(); });
+}
 function boot(){
   renderAll();
-  if(!(window.claude && window.claude.use)){ goLocal(); return; }
+  if(!(window.claude && window.claude.use)){
+    if(supaReady()) startSupabase(); else goLocal();
+    return;
+  }
   Promise.all([window.claude.use('db'), window.claude.use('user')]).then(function(r){
     var db = r[0], user = r[1];
     if(!db || !user){ goLocal(); return null; }
